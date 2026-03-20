@@ -878,6 +878,53 @@ async def health_check():
     }
 
 
+@api_router.get("/download/project.tar.gz")
+async def download_project():
+    """Download entire project as tar.gz for APK building"""
+    import tarfile
+    import io
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode='w:gz') as tar:
+        base = Path('/app')
+        files_to_include = [
+            'backend/server.py',
+            'backend/.env',
+            'backend/requirements.txt',
+            'frontend/app.json',
+            'frontend/eas.json',
+            'frontend/package.json',
+            'frontend/tsconfig.json',
+            'frontend/.env',
+            'frontend/eslint.config.js',
+            'frontend/metro.config.js',
+            'frontend/app/_layout.tsx',
+            'frontend/app/index.tsx',
+            'frontend/app/onboarding.tsx',
+            'frontend/app/connection.tsx',
+            'frontend/app/(tabs)/_layout.tsx',
+            'frontend/app/(tabs)/terminal.tsx',
+            'frontend/app/(tabs)/agent.tsx',
+            'frontend/app/(tabs)/files.tsx',
+            'frontend/app/(tabs)/settings.tsx',
+            'frontend/src/constants/themes.ts',
+            'frontend/src/contexts/ThemeContext.tsx',
+            'frontend/src/config.ts',
+        ]
+        for f in files_to_include:
+            full = base / f
+            if full.exists():
+                tar.add(str(full), arcname=f'termuxai/{f}')
+
+    buf.seek(0)
+    from starlette.responses import Response
+    return Response(
+        content=buf.read(),
+        media_type='application/gzip',
+        headers={'Content-Disposition': 'attachment; filename=termuxai-project.tar.gz'},
+    )
+
+
 # ===== Terminal HTML (for web iframe) =====
 
 @api_router.get("/terminal-html", response_class=HTMLResponse)
