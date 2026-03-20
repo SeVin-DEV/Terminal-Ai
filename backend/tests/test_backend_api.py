@@ -23,6 +23,57 @@ class TestHealthAndInfo:
         assert data["message"] == "TermuxAI API", f"Expected 'TermuxAI API', got {data.get('message')}"
         print(f"✓ API root endpoint working: {data}")
 
+    def test_health_endpoint(self, api_client):
+        """Test GET /api/health returns health status with storage type and terminal status"""
+        response = api_client.get(f"{BASE_URL}/api/health")
+        assert response.status_code == 200, f"Expected 200, got {response.status_code}: {response.text}"
+        
+        data = response.json()
+        assert "status" in data, "Response should contain 'status' field"
+        assert "storage" in data, "Response should contain 'storage' field"
+        assert "terminal_active" in data, "Response should contain 'terminal_active' field"
+        assert "version" in data, "Response should contain 'version' field"
+        
+        assert data["status"] == "ok", f"Expected status 'ok', got {data.get('status')}"
+        assert data["storage"] in ["mongodb", "json"], f"Storage should be 'mongodb' or 'json', got {data.get('storage')}"
+        assert isinstance(data["terminal_active"], bool), "terminal_active should be boolean"
+        assert data["version"] == "1.0.0", f"Expected version '1.0.0', got {data.get('version')}"
+        
+        print(f"✓ Health endpoint working: status={data['status']}, storage={data['storage']}, terminal_active={data['terminal_active']}")
+
+    def test_termux_setup_script(self, api_client):
+        """Test GET /api/termux-setup returns bash setup script"""
+        response = api_client.get(f"{BASE_URL}/api/termux-setup")
+        assert response.status_code == 200, f"Expected 200, got {response.status_code}: {response.text}"
+        
+        script = response.text
+        assert len(script) > 0, "Setup script should not be empty"
+        assert "#!/data/data/com.termux/files/usr/bin/bash" in script, "Script should have Termux shebang"
+        assert "pkg install" in script, "Script should contain 'pkg install' command"
+        assert "pip install" in script, "Script should contain 'pip install' command"
+        assert "tmux" in script, "Script should mention tmux"
+        assert "fastapi" in script.lower(), "Script should install FastAPI"
+        assert "uvicorn" in script.lower(), "Script should install uvicorn"
+        assert "start.sh" in script, "Script should create start.sh"
+        assert "stop.sh" in script, "Script should create stop.sh"
+        assert "status.sh" in script, "Script should create status.sh"
+        
+        print(f"✓ Termux setup script endpoint working: {len(script)} chars, contains all required commands")
+
+    def test_download_server_py(self, api_client):
+        """Test GET /api/download/server.py returns server.py file content"""
+        response = api_client.get(f"{BASE_URL}/api/download/server.py")
+        assert response.status_code == 200, f"Expected 200, got {response.status_code}: {response.text}"
+        
+        content = response.text
+        assert len(content) > 0, "Server.py content should not be empty"
+        assert "from fastapi import FastAPI" in content, "Should contain FastAPI import"
+        assert "app = FastAPI()" in content, "Should contain FastAPI app initialization"
+        assert "def health_check" in content or "@api_router.get(\"/health\")" in content, "Should contain health endpoint"
+        assert "AsyncIOMotorClient" in content or "_JDB" in content, "Should contain database client code"
+        
+        print(f"✓ Download server.py endpoint working: {len(content)} chars, valid Python FastAPI code")
+
 
 class TestConfigManagement:
     """Config API endpoints: POST and GET /api/config"""

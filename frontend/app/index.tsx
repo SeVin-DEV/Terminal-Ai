@@ -1,9 +1,7 @@
 import { useEffect, useState } from 'react';
 import { View, ActivityIndicator, StyleSheet } from 'react-native';
 import { useRouter } from 'expo-router';
-import AsyncStorage from '@react-native-async-storage/async-storage';
-
-const BACKEND_URL = process.env.EXPO_PUBLIC_BACKEND_URL;
+import { initBackendUrl, checkBackendHealth, getBackendUrl } from '../src/config';
 
 export default function Index() {
   const router = useRouter();
@@ -14,8 +12,18 @@ export default function Index() {
   }, []);
 
   const checkSetup = async () => {
+    const url = await initBackendUrl();
+
+    // Check if backend is reachable
+    const healthy = await checkBackendHealth(url);
+    if (!healthy) {
+      router.replace('/connection');
+      return;
+    }
+
+    // Check if config exists (onboarding completed)
     try {
-      const response = await fetch(`${BACKEND_URL}/api/config`);
+      const response = await fetch(`${url}/api/config`);
       if (response.ok) {
         const config = await response.json();
         if (config.has_api_key) {
@@ -24,7 +32,7 @@ export default function Index() {
         }
       }
     } catch (e) {
-      // Config not found or error
+      // Config not found
     }
     router.replace('/onboarding');
   };

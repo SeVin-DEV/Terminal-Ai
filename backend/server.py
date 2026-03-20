@@ -1,8 +1,7 @@
 from fastapi import FastAPI, APIRouter, WebSocket, WebSocketDisconnect, Request
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.responses import JSONResponse, HTMLResponse, PlainTextResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import logging
 import json
@@ -13,6 +12,7 @@ import termios
 import select
 import signal
 import asyncio
+import threading
 from pathlib import Path
 from pydantic import BaseModel, Field
 from typing import List, Optional
@@ -23,9 +23,114 @@ import httpx
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
-mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
+
+# ===== JSON File Storage (MongoDB-compatible async interface) =====
+
+class _JDoc:
+    def __init__(self, path):
+        self._path = Path(path)
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+
+    def _read(self):
+        if self._path.exists():
+            try:
+                return json.loads(self._path.read_text())
+            except Exception:
+                return []
+        return []
+
+    def _write(self, data):
+        self._path.write_text(json.dumps(data, default=str, indent=2))
+
+    def _match(self, doc, filt):
+        return all(doc.get(k) == v for k, v in filt.items()) if filt else True
+
+    def _clean(self, doc):
+        return {k: v for k, v in doc.items() if k != '_id'}
+
+    async def find_one(self, filt=None, proj=None):
+        filt = filt or {}
+        for d in self._read():
+            if self._match(d, filt):
+                return self._clean(d)
+        return None
+
+    async def insert_one(self, doc):
+        with self._lock:
+            data = self._read()
+            data.append(self._clean(doc))
+            self._write(data)
+
+    async def update_one(self, filt, update, upsert=False):
+        with self._lock:
+            data = self._read()
+            filt = filt or {}
+            for i, d in enumerate(data):
+                if self._match(d, filt):
+                    if '$set' in update:
+                        data[i].update(update['$set'])
+                    self._write(data)
+                    return
+            if upsert and '$set' in update:
+                data.append(update['$set'])
+                self._write(data)
+
+    async def delete_many(self, filt=None):
+        with self._lock:
+            if not filt:
+                self._write([])
+            else:
+                data = [d for d in self._read() if not self._match(d, filt)]
+                self._write(data)
+
+    def find(self, filt=None, proj=None):
+        filt = filt or {}
+        return _JCursor([self._clean(d) for d in self._read() if self._match(d, filt)])
+
+
+class _JCursor:
+    def __init__(self, data):
+        self._data = data
+
+    def sort(self, key, direction=1):
+        self._data.sort(key=lambda x: x.get(key, ''), reverse=(direction == -1))
+        return self
+
+    def limit(self, n):
+        self._data = self._data[:n]
+        return self
+
+    async def to_list(self, length=None):
+        return self._data[:length] if length else self._data
+
+
+class _JDB:
+    def __init__(self, data_dir):
+        self._dir = Path(data_dir)
+        self._dir.mkdir(parents=True, exist_ok=True)
+
+    def __getattr__(self, name):
+        return _JDoc(self._dir / f"{name}.json")
+
+
+# ===== Auto-detect storage backend =====
+STORAGE_TYPE = 'json'
+client = None
+
+try:
+    mongo_url = os.environ.get('MONGO_URL', '')
+    if mongo_url:
+        from motor.motor_asyncio import AsyncIOMotorClient
+        client = AsyncIOMotorClient(mongo_url)
+        db = client[os.environ.get('DB_NAME', 'termuxai')]
+        STORAGE_TYPE = 'mongodb'
+    else:
+        raise KeyError("No MONGO_URL")
+except (ImportError, KeyError, Exception):
+    data_dir = os.environ.get('DATA_DIR', str(ROOT_DIR / 'data'))
+    db = _JDB(data_dir)
+    STORAGE_TYPE = 'json'
 
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
@@ -641,6 +746,138 @@ async def delete_file(path: str):
         return JSONResponse(status_code=500, content={"detail": str(e)})
 
 
+# ===== Termux Setup & Download Endpoints =====
+
+@api_router.get("/download/server.py", response_class=PlainTextResponse)
+async def download_server():
+    """Serve server.py for Termux setup"""
+    server_path = ROOT_DIR / 'server.py'
+    return PlainTextResponse(content=server_path.read_text())
+
+
+@api_router.get("/termux-setup", response_class=PlainTextResponse)
+async def termux_setup(request: Request):
+    """Serve automated Termux setup script"""
+    host = request.headers.get("host", "localhost:8001")
+    scheme = request.headers.get("x-forwarded-proto", "http")
+    base_url = f"{scheme}://{host}"
+
+    script = f"""#!/data/data/com.termux/files/usr/bin/bash
+set -e
+echo ""
+echo "======================================"
+echo "  TermuxAI Auto-Setup Script"
+echo "======================================"
+echo ""
+
+# Step 1: Update and install packages
+echo "[1/5] Installing system packages..."
+pkg update -y && pkg upgrade -y
+pkg install -y python tmux
+
+# Step 2: Install Python dependencies
+echo "[2/5] Installing Python packages..."
+pip install --upgrade pip
+pip install fastapi uvicorn httpx python-dotenv
+
+# Step 3: Create project directory
+echo "[3/5] Creating project structure..."
+mkdir -p ~/termuxai/data
+cd ~/termuxai
+
+# Step 4: Download server.py
+echo "[4/5] Downloading server..."
+curl -sSL {base_url}/api/download/server.py -o server.py
+
+# Create .env for local JSON storage
+cat > .env << 'ENVEOF'
+STORAGE_TYPE=json
+DATA_DIR=/data/data/com.termux/files/home/termuxai/data
+DB_NAME=termuxai
+ENVEOF
+
+# Step 5: Create management scripts
+echo "[5/5] Creating management scripts..."
+
+# Start script with tmux + wake-lock + auto-restart
+cat > start.sh << 'STARTEOF'
+#!/data/data/com.termux/files/usr/bin/bash
+echo "Starting TermuxAI server..."
+termux-wake-lock 2>/dev/null || true
+# Kill existing session if any
+tmux kill-session -t termuxai 2>/dev/null || true
+# Start server in tmux with auto-restart loop
+tmux new-session -d -s termuxai "cd ~/termuxai && while true; do echo '=== TermuxAI Server Starting ===' && python -m uvicorn server:app --host 0.0.0.0 --port 8001 --reload; echo ''; echo 'Server stopped. Restarting in 3s...'; sleep 3; done"
+echo ""
+echo "TermuxAI server started!"
+echo "  View logs:  tmux attach -t termuxai"
+echo "  Stop:       ~/termuxai/stop.sh"
+echo "  URL:        http://localhost:8001"
+echo ""
+STARTEOF
+chmod +x start.sh
+
+# Stop script
+cat > stop.sh << 'STOPEOF'
+#!/data/data/com.termux/files/usr/bin/bash
+echo "Stopping TermuxAI server..."
+tmux kill-session -t termuxai 2>/dev/null || true
+termux-wake-unlock 2>/dev/null || true
+echo "Server stopped."
+STOPEOF
+chmod +x stop.sh
+
+# Status script
+cat > status.sh << 'STATUSEOF'
+#!/data/data/com.termux/files/usr/bin/bash
+if tmux has-session -t termuxai 2>/dev/null; then
+    echo "TermuxAI: RUNNING"
+    echo "  View: tmux attach -t termuxai"
+    echo "  Stop: ~/termuxai/stop.sh"
+    curl -s http://localhost:8001/api/ 2>/dev/null && echo "  API: OK" || echo "  API: Starting..."
+else
+    echo "TermuxAI: STOPPED"
+    echo "  Start: ~/termuxai/start.sh"
+fi
+STATUSEOF
+chmod +x status.sh
+
+# Auto-start on Termux boot (optional - needs Termux:Boot)
+mkdir -p ~/.termux/boot
+cat > ~/.termux/boot/termuxai << 'BOOTEOF'
+#!/data/data/com.termux/files/usr/bin/bash
+cd ~/termuxai && ./start.sh
+BOOTEOF
+chmod +x ~/.termux/boot/termuxai
+
+echo ""
+echo "======================================"
+echo "  Setup Complete!"
+echo "======================================"
+echo ""
+echo "  Start server:  cd ~/termuxai && ./start.sh"
+echo "  Stop server:   cd ~/termuxai && ./stop.sh"
+echo "  Check status:  cd ~/termuxai && ./status.sh"
+echo ""
+echo "  Auto-start on boot: Install Termux:Boot app"
+echo ""
+echo "Starting server now..."
+cd ~/termuxai && ./start.sh
+"""
+    return PlainTextResponse(content=script)
+
+
+@api_router.get("/health")
+async def health_check():
+    """Health check endpoint for connection detection"""
+    return {
+        "status": "ok",
+        "storage": STORAGE_TYPE,
+        "terminal_active": terminal._running,
+        "version": "1.0.0",
+    }
+
+
 # ===== Terminal HTML (for web iframe) =====
 
 @api_router.get("/terminal-html", response_class=HTMLResponse)
@@ -800,7 +1037,7 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def startup():
-    logger.info("TermuxAI backend starting...")
+    logger.info(f"TermuxAI backend starting... (storage: {STORAGE_TYPE})")
     await terminal.restore_session()
 
 
@@ -808,4 +1045,5 @@ async def startup():
 async def shutdown():
     await terminal.save_now()
     terminal.stop()
-    client.close()
+    if client:
+        client.close()
