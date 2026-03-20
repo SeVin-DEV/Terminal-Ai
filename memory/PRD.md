@@ -72,3 +72,35 @@ TermuxAI is a mobile-first coding and development environment powered by an AI a
 3. Configure project: `eas build:configure`
 4. Build APK: `eas build --platform android --profile preview`
 5. Download APK from the build URL provided by EAS
+
+## Self-Contained Termux Deployment
+The app supports running entirely on a single Android device with Termux:
+
+### Connection Flow
+1. App launches → checks if backend is reachable at saved URL
+2. If reachable → auto-routes to terminal/onboarding
+3. If not → shows Connection Setup screen with:
+   - **Local Mode**: Setup instructions for Termux + one-command auto-setup
+   - **Remote Mode**: Enter URL for cloud/tunnel backend (Cloudflare, serveo, ngrok)
+
+### Termux Auto-Setup (One Command)
+```bash
+curl -sSL https://your-backend-url/api/termux-setup | bash
+```
+This automatically:
+- Installs Python, tmux
+- Downloads server.py from the backend
+- Creates start.sh / stop.sh / status.sh management scripts
+- Configures tmux session with auto-restart on crash
+- Enables termux-wake-lock to prevent sleep
+- Optionally auto-starts on Termux boot (with Termux:Boot app)
+
+### Backend Storage
+- **Cloud**: Uses MongoDB (auto-detected via MONGO_URL env var)
+- **Termux**: Uses JSON file storage (no MongoDB needed, fully self-contained)
+
+### Server Management
+- Start: `~/termuxai/start.sh` (tmux + wake-lock + auto-restart)
+- Stop: `~/termuxai/stop.sh`
+- Status: `~/termuxai/status.sh`
+- View logs: `tmux attach -t termuxai`
